@@ -1,10 +1,12 @@
 package main
 
+import "core:bytes"
 import "core:fmt"
 import "core:mem"
 import "core:path/filepath"
 import "core:os"
 import "core:slice"
+import "core:strings"
 import rl "vendor:raylib"
 
 DEBUG_MEMORY :: false
@@ -12,14 +14,14 @@ DEBUG_MEMORY :: false
 PATH_BASE_GAME :: `game`
 
 /* .plan
-be able to fetch the current version of a given creature, item, area, 2da, etc
-    this means pull from the override folder first, and only if a file isn't there, load one from the base data
-        override has loose files directly editable
-        base data is packed in bif files
-
-should we load all BIFs and override files all at once, or only on demand?
-    we at least need to know what the possible files are though, so that implies at least partially loading everything
+* be able to fetch the current version of a given creature, item, area, 2da, etc and read/modify it
+    * need to be able to pull from data/ BIFs, override/ loose files, and save file archive
 */
+
+RESREF :: [8]u8
+Orientation :: enum u16 {
+    South, SSW, SW, WSW, West, WNW, NW, NNW, North, NNE, NE, ENE, East, ESE, SE, SSE
+}
 
 BIF_Header :: struct {
     signature : [4]u8,
@@ -27,25 +29,6 @@ BIF_Header :: struct {
     num_files : u32,
     num_tilesets : u32,
     offset_files : u32, // offset from start of file to file table
-}
-KEY_Header :: struct {
-    signature : [4]u8,
-    version : [4]u8,
-    num_bifs : u32,
-    num_resources : u32,
-    offset_bifs : u32, // offset from start of file to bif table
-    offset_resources : u32, // offset from start of file to resource table
-}
-KEY_BIF_Entry :: struct {
-    file_length : u32,
-    offset_name : u32,
-    name_length : u32, // includes null terminator
-    location_bits : u16,
-}
-
-RESREF :: [8]u8
-Orientation :: enum u16 {
-    South, SSW, SW, WSW, West, WNW, NW, NNW, North, NNE, NE, ENE, East, ESE, SE, SSE
 }
 ARE_Header :: struct {
     signature : [4]u8,
@@ -142,6 +125,88 @@ ARE :: struct {
     actors : []ARE_Actor,
 }
 
+
+Locator :: bit_field u32 {
+    file_index: u32 | 14, // non-tileset file index (any 12bit value so long as it matches value in BIF)
+    tileset_index: u32 | 6, // tileset index
+    bif_index: u32 | 12, // source BIF index
+}
+KEY_Header :: struct {
+    signature : [4]u8,
+    version : [4]u8,
+    num_bifs : u32,
+    num_resources : u32,
+    offset_bifs : u32, // offset from start of file to bif table
+    offset_resources : u32, // offset from start of file to resource table
+}
+#assert( size_of(KEY_Header) == 24 )
+KEY_BIF :: struct {
+    file_length : u32,
+    offset_name : u32,
+    name_length : u16, // includes null terminator
+    location_bits : u16,
+}
+#assert( size_of(KEY_BIF) == 12 )
+KEY_Resource :: struct #packed {
+    name : RESREF,
+    type : u16,
+    locator : Locator,
+}
+#assert( size_of(KEY_Resource) == 14 )
+KEY :: struct {
+    backing : []u8,
+    header : KEY_Header,
+    bifs : []KEY_BIF,
+    resources : []KEY_Resource,
+
+    // not automatically kept in sync
+    bif_names : [dynamic]string,
+    res_names : [dynamic]string,
+}
+
+DB :: struct {
+    key : KEY,
+}
+
+resref_move_to_string :: proc( resref: ^RESREF ) -> string {
+    return string( bytes.trim_right_null( resref[:] ) )
+}
+print_KEY_Resource :: proc( key: KEY, res: KEY_Resource ) {
+    res := res
+    fmt.printfln( "<name: %s type: %d locator: %d", resref_move_to_string( &res.name ), res.type, res.locator )
+    foo := key.bif_names[ res.locator.bif_index ]
+    fmt.printfln( "bif name: %s", foo )
+}
+
+do_key :: proc() -> bool {
+    path := filepath.join( {PATH_BASE_GAME, "chitin.key"} )
+    key : KEY
+    key.backing = os.read_entire_file( path ) or_return
+    key.header = slice.to_type( key.backing[0:], KEY_Header )
+    assert( key.header.signature == "KEY ", "Unexpected signature" )
+    assert( key.header.version == "V1  ", "Unexpected version" )
+    key.bifs = transmute( []KEY_BIF )key.backing[ key.header.offset_bifs: ] [ :key.header.num_bifs ]
+    key.resources = transmute( []KEY_Resource )key.backing[ key.header.offset_resources: ] [ :key.header.num_resources ]
+
+    // convienence views on data
+    for bif in key.bifs {
+        filename := key.backing[ bif.offset_name: ][:bif.name_length-1] // -1 to exclude null terminator
+        append( &key.bif_names, string(filename) )
+    }
+    for &res in key.resources {
+        res_name := resref_move_to_string( &res.name )
+        append( &key.res_names, res_name )
+    }
+    when true { // tests
+        fmt.printfln( "# BIF: %d # RES: %d", len(key.bifs), len(key.resources) )
+        print_KEY_Resource( key, key.resources[0] )
+        print_KEY_Resource( key, key.resources[100] )
+        print_KEY_Resource( key, key.resources[1000] )
+        print_KEY_Resource( key, key.resources[5000] )
+    }
+    return true
+}
+
 main :: proc() {
     when DEBUG_MEMORY {
         tracking_allocator : mem.Tracking_Allocator
@@ -158,6 +223,7 @@ main :: proc() {
         }
         defer { print_alloc_stats( &tracking_allocator ) }
     }
+    test_locator()
 
     when false { // sample globbing files
         path_data := filepath.join( {PATH_BASE_GAME, "data"}, context.temp_allocator )
@@ -184,13 +250,13 @@ main :: proc() {
         fmt.printfln( "header: %v", header )
 
         // read one BIF entry
-        bif_entry : KEY_BIF_Entry
+        bif_entry : KEY_BIF
         os.seek( file, cast(i64) header.offset_bifs, os.SEEK_SET )
         os.read_ptr( file, &bif_entry, size_of( bif_entry ) )
         fmt.printfln( "bif_entry: %v", bif_entry )
-        
+
     }
-    
+
     when false { // sample loading a BIF file
         fmt.printfln( "Loading BIF file" )
         path := "AR120X.bif"
@@ -205,7 +271,7 @@ main :: proc() {
         }
 
         fmt.printfln( "header: %v", header )
-        
+
     }
 
     when false { // sample ARE file
@@ -243,11 +309,11 @@ main :: proc() {
         }
         fmt.printfln( "ex actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
     }
-    when true { // ARE with full data and slice method
+    when false { // ARE with full data and slice method
         fmt.printfln( "Loading ARE file" )
         //path := `D:\games\Infinity Engine\Icewind Dale Enhanced Edition\override\AR9714.ARE`
         path := filepath.join( {PATH_BASE_GAME, "override", "AR9714.ARE"} )
-        
+
         file_data, succ := os.read_entire_file( path )
         if !succ {
             fmt.printfln( "Error reading file" )
@@ -277,5 +343,6 @@ main :: proc() {
         fmt.printfln( "num actors: %d", len(area.actors) )
         fmt.printfln( "should be skeleton: actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
     }
-    fmt.printfln( "Done" )
+    ret := do_key()
+    fmt.printfln( "do_key: %v", ret )
 }

@@ -1,4 +1,4 @@
 #!/bin/sh
 if [ -d ../src ]; then cd ../; fi
 if [ -d bin ]; then cd bin; fi
-odin run ../src/ -out:infinitymod.exe -debug
+odin run ../src/ -out:infinity-mod.exe -debug
