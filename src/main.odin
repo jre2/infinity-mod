@@ -33,13 +33,6 @@ Orientation :: enum u16 {
     South, SSW, SW, WSW, West, WNW, NW, NNW, North, NNE, NE, ENE, East, ESE, SE, SSE
 }
 
-BIF_Header :: struct {
-    signature : [4]u8,
-    version : [4]u8,
-    num_files : u32,
-    num_tilesets : u32,
-    offset_files : u32, // offset from start of file to file table
-}
 ARE_Header :: struct {
     signature : [4]u8,
     version : [4]u8,
@@ -135,6 +128,39 @@ ARE :: struct {
     actors : []ARE_Actor,
 }
 
+BIF_Header :: struct {
+    signature : [4]u8,
+    version : [4]u8,
+    num_files : u32,
+    num_tilesets : u32,
+    offset_files : u32, // offset from start of file to file table
+}
+#assert( size_of(BIF_Header) == 20 )
+BIF_File :: struct {
+    locator : Locator,
+    offset_resource : u32,
+    size_resource : u32,
+    type_resource : u16,
+    unknown : u16,
+}
+#assert( size_of(BIF_File) == 16 )
+BIF_Tileset :: struct {
+    locator : Locator,
+    offset_tileset : u32,
+    num_tiles : u32,
+    sizeof_tile : u32,
+    type : u16, // always 0x3eb (TIS)
+    unknown : u16,
+}
+#assert( size_of(BIF_Tileset) == 20 )
+BIF :: struct {
+    backing : []u8,
+    header : BIF_Header,
+    files : []BIF_File,
+    tilesets : []BIF_Tileset,
+
+    offset_tiles : u32,
+}
 
 Locator :: bit_field u32 {
     file_index: u32 | 14, // non-tileset file index (any 12bit value so long as it matches value in BIF)
@@ -168,28 +194,30 @@ KEY :: struct {
     header : KEY_Header,
     bifs : []KEY_BIF,
     resources : []KEY_Resource,
-
-    // not automatically kept in sync
-    bif_names : [dynamic]string,
-    res_names : [dynamic]string,
 }
 
 DB :: struct {
     key : KEY,
+
+    // convienence and not automatically kept in sync
+    res_to_bif: map[string]string
 }
 
 get_KEY_BIF_name :: proc( db: DB, keybif: KEY_BIF ) -> string {
     return string( db.key.backing[ keybif.offset_name: ][ :keybif.name_length-1] ) // -1 to exclude null terminator
 }
 print_KEY_BIF :: proc( db: DB, keybif: KEY_BIF ) {
-    fmt.printfln( "<name '%s' len %d b loc_bits '%v'>", get_KEY_BIF_name( db, keybif ), keybif.file_length, keybif.location_bits )
+    fmt.printfln( "<KEY_BIF name '%s' len %d b loc_bits '%v'>", get_KEY_BIF_name( db, keybif ), keybif.file_length, keybif.location_bits )
 }
 resref_move_to_string :: proc( resref: ^RESREF ) -> string {
     return string( bytes.trim_right_null( resref[:] ) )
 }
+get_Key_Resource_BIF_name :: proc( db: DB, res: KEY_Resource ) -> string {
+    return get_KEY_BIF_name( db, db.key.bifs[ res.locator.bif_index ] )
+}
 print_KEY_Resource :: proc( db: DB, res: KEY_Resource ) {
     res := res
-    fmt.printfln( "<name: %s type: %d locator: %d bif: %s", resref_move_to_string( &res.name ), res.type, res.locator, get_KEY_BIF_name( db, db.key.bifs[ res.locator.bif_index ] ) )
+    fmt.printfln( "<KEY_RES name: %s type: %d locator: %d bif: %s", resref_move_to_string( &res.name ), res.type, res.locator, get_KEY_BIF_name( db, db.key.bifs[ res.locator.bif_index ] ) )
 }
 
 load :: proc( path_game_base: string, debug: bool = true ) -> (db: DB, succ: bool) {
@@ -201,37 +229,56 @@ load :: proc( path_game_base: string, debug: bool = true ) -> (db: DB, succ: boo
         assert( db.key.header.version == "V1  ", "Unexpected version" )
         db.key.bifs = transmute( []KEY_BIF )db.key.backing[ db.key.header.offset_bifs: ] [ :db.key.header.num_bifs ]
         db.key.resources = transmute( []KEY_Resource )db.key.backing[ db.key.header.offset_resources: ] [ :db.key.header.num_resources ]
-
-        if debug { // debug KEY
-            fmt.printfln( "Load KEY #BIF %d #RES %d", len(db.key.bifs), len(db.key.resources) )
-            print_KEY_BIF( db, db.key.bifs[100] )
-            print_KEY_Resource( db, db.key.resources[1000] )
+    }
+    { // for convienence
+        for &res in db.key.resources {
+            res_name := resref_move_to_string( &res.name )
+            db.res_to_bif[ res_name ] = get_KEY_BIF_name( db, db.key.bifs[ res.locator.bif_index ] ) // I don't think this copies the string, so be careful of that
         }
     }
+
+    if false {
+        for keybif in db.key.bifs {
+            if get_KEY_BIF_name( db, keybif ) == "data/AR120X.bif" {
+                print_KEY_BIF( db, keybif )
+            }
+        }
+        for &res in db.key.resources {
+            if get_Key_Resource_BIF_name( db, res ) == "data/AR120X.bif" {
+                print_KEY_Resource( db, res )
+            }
+        }
+    }
+    // now we can load all the BIFs from the key file
+    // for now just test with one
+    name := get_KEY_BIF_name( db, db.key.bifs[0] )
+    name = "data/AR120X.bif"
+    { // load BIF file
+        path := filepath.join( {path_game_base, name} )
+        bif : BIF
+        fmt.printfln( "Loading BIF file %s", path )
+        bif.backing = os.read_entire_file( path ) or_return
+        bif.header = slice.to_type( bif.backing[0:], BIF_Header )
+        assert( bif.header.signature == "BIFF", "Unexpected signature" )
+        assert( bif.header.version == "V1  ", "Unexpected version" )
+        fmt.printfln( "BIF #files %d #tilesets %d", bif.header.num_files, bif.header.num_tilesets )
+        bif.files = transmute( []BIF_File )bif.backing[ bif.header.offset_files: ] [ :bif.header.num_files ]
+        bif.offset_tiles = bif.header.offset_files + bif.header.num_files * size_of( BIF_File )
+        bif.tilesets = transmute( []BIF_Tileset )bif.backing[ bif.offset_tiles: ] [ :bif.header.num_tilesets ]
+
+        if false {
+            // some examples
+            for bif_file in bif.files {
+                fmt.printfln( "File: %v", bif_file )
+            }
+            for tileset in bif.tilesets {
+                fmt.printfln( "Tileset: %v", tileset )
+            }
+        }
+    }
+    succ = true
     return
 }
-do_key :: proc() -> bool {
-    path := filepath.join( {PATH_BASE_GAME, "chitin.key"} )
-    key : KEY
-    key.backing = os.read_entire_file( path ) or_return
-    key.header = slice.to_type( key.backing[0:], KEY_Header )
-    assert( key.header.signature == "KEY ", "Unexpected signature" )
-    assert( key.header.version == "V1  ", "Unexpected version" )
-    key.bifs = transmute( []KEY_BIF )key.backing[ key.header.offset_bifs: ] [ :key.header.num_bifs ]
-    key.resources = transmute( []KEY_Resource )key.backing[ key.header.offset_resources: ] [ :key.header.num_resources ]
-
-    // convienence views on data
-    for bif in key.bifs {
-        filename := key.backing[ bif.offset_name: ][:bif.name_length-1] // -1 to exclude null terminator
-        append( &key.bif_names, string(filename) )
-    }
-    for &res in key.resources {
-        res_name := resref_move_to_string( &res.name )
-        append( &key.res_names, res_name )
-    }
-    return true
-}
-
 main :: proc() {
     when DEBUG_MEMORY {
         tracking_allocator : mem.Tracking_Allocator
@@ -256,48 +303,13 @@ main :: proc() {
         fmt.printfln( "pat_bifs: %v", pat_bifs )
         fmt.printfln( "path_bifs: %v", path_bifs[0] )
     }
-
     when false { // sample load KEY file
-        path := `D:\games\Infinity Engine\Icewind Dale Enhanced Edition\chitin.key`
-        fmt.printfln( "Loading KEY file" )
         file, err := os.open( path, os.O_RDONLY )
         defer os.close( file )
-        if err != nil {
-            fmt.printfln( "Error opening file: %s", os.error_string(err) )
-            return
-        }
-
-        header : KEY_Header
         os.read_ptr( file, &header, size_of( header ) )
-        assert( header.signature == "KEY ", "Unexpected signature" )
-        assert( header.version == "V1  ", "Unexpected version" )
-        fmt.printfln( "header: %v", header )
-
-        // read one BIF entry
-        bif_entry : KEY_BIF
         os.seek( file, cast(i64) header.offset_bifs, os.SEEK_SET )
         os.read_ptr( file, &bif_entry, size_of( bif_entry ) )
-        fmt.printfln( "bif_entry: %v", bif_entry )
-
     }
-
-    when false { // sample loading a BIF file
-        fmt.printfln( "Loading BIF file" )
-        path := "AR120X.bif"
-
-        header : BIF_Header
-        //file, err := os.open( path, os.O_RDONLY )
-
-        buf, succ := os.read_entire_file( path )
-        if succ {
-            fmt.printfln( "read %v bytes", len(buf) )
-            fmt.printfln( "buf: %s", buf[:4] )
-        }
-
-        fmt.printfln( "header: %v", header )
-
-    }
-
     when false { // sample ARE file
         fmt.printfln( "Loading ARE file" )
         path := `D:\games\Infinity Engine\Icewind Dale Enhanced Edition\override\AR9714.ARE`
@@ -367,5 +379,6 @@ main :: proc() {
         fmt.printfln( "num actors: %d", len(area.actors) )
         fmt.printfln( "should be skeleton: actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
     }
-    load( PATH_BASE_GAME )
+    db, succ := load( PATH_BASE_GAME )
+    fmt.printfln( "Load -> %v", succ )
 }
