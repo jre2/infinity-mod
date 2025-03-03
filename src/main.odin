@@ -15,7 +15,17 @@ PATH_BASE_GAME :: `game`
 
 /* .plan
 * be able to fetch the current version of a given creature, item, area, 2da, etc and read/modify it
-    * need to be able to pull from data/ BIFs, override/ loose files, and save file archive
+    * need to be able to pull from data/ BIFs, override/ loose files, and save file archives
+* be able to edit rest encounters for areas and 2DA spawngroups, and replace them into on-going games and/or override files
+
+FUTURE: be able to extend the Actors in an area. Since actors array is fixed, we need to entirely recreate the ARE file
+    * so our normal ARE struct (which is a backing buffer plus editable views but can't change sizes) won't work nicely
+    * a) use dynamic arrays for actors, a completely different ARE struct, and new (de)serialization mechanism
+        * ie. a more complex deserialization into high level struct, manipulate it via dynamic arrays, then serialize it into low level struct
+        * the danger is we might not serialize it into a valid file if there's specific ordering or padding requirements we're not aware of
+    * b) keep the same structs but add helper functions to add/remove from the fixed arrays, which handle resizing and copying into a new buffer
+        * ie. the data is always a valid ARE struct but helper functions make it easier to manipulate
+        * this seems safer but more annoying to work with
 */
 
 RESREF :: [8]u8
@@ -168,16 +178,38 @@ DB :: struct {
     key : KEY,
 }
 
+get_KEY_BIF_name :: proc( db: DB, keybif: KEY_BIF ) -> string {
+    return string( db.key.backing[ keybif.offset_name: ][ :keybif.name_length-1] ) // -1 to exclude null terminator
+}
+print_KEY_BIF :: proc( db: DB, keybif: KEY_BIF ) {
+    fmt.printfln( "<name '%s' len %d b loc_bits '%v'>", get_KEY_BIF_name( db, keybif ), keybif.file_length, keybif.location_bits )
+}
 resref_move_to_string :: proc( resref: ^RESREF ) -> string {
     return string( bytes.trim_right_null( resref[:] ) )
 }
-print_KEY_Resource :: proc( key: KEY, res: KEY_Resource ) {
+print_KEY_Resource :: proc( db: DB, res: KEY_Resource ) {
     res := res
-    fmt.printfln( "<name: %s type: %d locator: %d", resref_move_to_string( &res.name ), res.type, res.locator )
-    foo := key.bif_names[ res.locator.bif_index ]
-    fmt.printfln( "bif name: %s", foo )
+    fmt.printfln( "<name: %s type: %d locator: %d bif: %s", resref_move_to_string( &res.name ), res.type, res.locator, get_KEY_BIF_name( db, db.key.bifs[ res.locator.bif_index ] ) )
 }
 
+load :: proc( path_game_base: string, debug: bool = true ) -> (db: DB, succ: bool) {
+    { // load KEY file
+        path := filepath.join( {path_game_base, "chitin.key"} )
+        db.key.backing = os.read_entire_file( path ) or_return
+        db.key.header = slice.to_type( db.key.backing[0:], KEY_Header )
+        assert( db.key.header.signature == "KEY ", "Unexpected signature" )
+        assert( db.key.header.version == "V1  ", "Unexpected version" )
+        db.key.bifs = transmute( []KEY_BIF )db.key.backing[ db.key.header.offset_bifs: ] [ :db.key.header.num_bifs ]
+        db.key.resources = transmute( []KEY_Resource )db.key.backing[ db.key.header.offset_resources: ] [ :db.key.header.num_resources ]
+
+        if debug { // debug KEY
+            fmt.printfln( "Load KEY #BIF %d #RES %d", len(db.key.bifs), len(db.key.resources) )
+            print_KEY_BIF( db, db.key.bifs[100] )
+            print_KEY_Resource( db, db.key.resources[1000] )
+        }
+    }
+    return
+}
 do_key :: proc() -> bool {
     path := filepath.join( {PATH_BASE_GAME, "chitin.key"} )
     key : KEY
@@ -196,13 +228,6 @@ do_key :: proc() -> bool {
     for &res in key.resources {
         res_name := resref_move_to_string( &res.name )
         append( &key.res_names, res_name )
-    }
-    when true { // tests
-        fmt.printfln( "# BIF: %d # RES: %d", len(key.bifs), len(key.resources) )
-        print_KEY_Resource( key, key.resources[0] )
-        print_KEY_Resource( key, key.resources[100] )
-        print_KEY_Resource( key, key.resources[1000] )
-        print_KEY_Resource( key, key.resources[5000] )
     }
     return true
 }
@@ -223,7 +248,6 @@ main :: proc() {
         }
         defer { print_alloc_stats( &tracking_allocator ) }
     }
-    test_locator()
 
     when false { // sample globbing files
         path_data := filepath.join( {PATH_BASE_GAME, "data"}, context.temp_allocator )
@@ -343,6 +367,5 @@ main :: proc() {
         fmt.printfln( "num actors: %d", len(area.actors) )
         fmt.printfln( "should be skeleton: actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
     }
-    ret := do_key()
-    fmt.printfln( "do_key: %v", ret )
+    load( PATH_BASE_GAME )
 }
