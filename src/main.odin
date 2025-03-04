@@ -15,11 +15,8 @@ PATH_GAME_BASE :: `D:\games\Infinity Engine\Icewind Dale Enhanced Edition`
 PATH_SAVE_BASE :: `C:\Users\rin\Documents\Icewind Dale - Enhanced Edition`
 
 /* .plan
-- get list of all resources of a given type
-- detect whether resource is in SAV, loose override, or data/ BIF
-- load SAV file; decompress, get individual files, etc
-+ reconstruct SAV after modifying files; switch to vendor zlib so we can compress
 + load ARE from loose, BIF archive, or SAV archive, depending on location
++ reconstruct SAV after modifying files; switch to vendor zlib so we can compress
 + save ARE file to loose (if BIF or override) or SAV archive (then reconstruct)
 FUTURE: support modifying ARE actors list; be able to reconstruct from scratch
 */
@@ -244,7 +241,6 @@ DB :: struct {
     key : KEY,
     sav : SAV,
     // convienence and not automatically kept in sync
-    res_to_bif: map[string]string,
     areas: [dynamic]string, // resource names for .ARE files
 }
 
@@ -312,9 +308,7 @@ load_SAV :: proc( path: string ) -> (sav: SAV, err: Error) {
 
         zbuf : bytes.Buffer
         odin_zlib.inflate( savfile.data_compressed, &zbuf ) or_return
-        //bytes.buffer_destroy( &zbuf )
         sav.files[ string(savfile.filename[: len(savfile.filename)-1]) ] = bytes.buffer_to_bytes( &zbuf )
-        //delete( sav.files[ string(savfile.filename[: len(savfile.filename)-1]) ] )
     }
     return
 }
@@ -330,17 +324,6 @@ load_DB :: proc( path_game_base: string, save_name: string, debug: bool = true )
             append( &db.areas, resref_move_to_string( &res.name ) )
         }
     }
-    if false {
-        for keybif in db.key.bifs {
-            //bif := load_BIF( filepath.join( {path_game_base, get_KEY_BIF_name( db, keybif ) } ) ) or_return
-        }
-    } else if false {
-        bif := load_BIF( filepath.join( {path_game_base, "data/AREAS.bif" } ) ) or_return
-        for bif_file in bif.files { fmt.printfln( "%v", bif_file ) }
-        for tileset in bif.tilesets { fmt.printfln( "%v", tileset ) }
-        //TODO load an .ARE file from within a .BIF file
-    }
-    //load_ARE( bytes.buffer_to_bytes( &zbuf ) ) or_return
     return
 }
 delete_DB :: proc( db: ^DB ) {
@@ -349,7 +332,6 @@ delete_DB :: proc( db: ^DB ) {
     }
     delete( db.sav.files )
     delete( db.sav.backing )
-    delete( db.res_to_bif )
     delete( db.areas )
     delete( db.key.backing )
 }
@@ -374,7 +356,9 @@ locate_resource :: proc( db: DB, resname: string, restype: RESType ) -> Location
 }
 update :: proc( db: DB ) -> (err: Error){
     for area in db.areas {
-        if area != "AR1201" { continue }
+        //if area != "AR1201" { continue } // save
+        //if area != "AR2102" { continue } // override
+        if area != "AR2003" { continue } // data
 
         location := locate_resource( db, area, .ARE )
         filename := fmt.aprintf( "%s.%s", area, RESType_TO_EXTENTION[ .ARE ] )
@@ -383,7 +367,24 @@ update :: proc( db: DB ) -> (err: Error){
         #partial switch location {
         case .Save:
             buf := db.sav.files[ filename ]
-            //load_ARE( buf ) or_return
+            are := load_ARE( buf ) or_return
+            defer delete( are.backing )
+        case .Data:
+            fmt.printfln( "Loading from bif..." )
+            for &res in db.key.resources {
+                if resref_move_to_string(&res.name) == area && res.type == .ARE {
+                    path_bif := filepath.join( {PATH_GAME_BASE, get_Key_Resource_BIF_name( db, res ) } )
+                    defer delete( path_bif )
+                    bif := load_BIF( path_bif ) or_return
+                    defer delete( bif.backing )
+                    fmt.printfln( "...loaded bif %s", get_Key_Resource_BIF_name( db, res ) )
+                    //TODO find file within BIF, load_ARE
+                    //for bif_file in bif.files { fmt.printfln( "%v", bif_file ) }
+                }
+            }
+        case .Override:
+            fmt.printfln( "Loading from override..." )
+            //TODO
         }
     }
     return
