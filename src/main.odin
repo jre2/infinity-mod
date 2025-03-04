@@ -354,37 +354,44 @@ locate_resource :: proc( db: DB, resname: string, restype: RESType ) -> Location
     }
     return .DNE
 }
-update :: proc( db: DB ) -> (err: Error){
+update_areas :: proc( db: DB ) -> (err: Error){
     for area in db.areas {
-        //if area != "AR1201" { continue } // save
-        //if area != "AR2102" { continue } // override
-        if area != "AR2003" { continue } // data
+        //if area != "AR1201" { continue } // SAV
+        if area != "AR2102" { continue } // override
+        //if area != "AR2003" { continue } // BIF
 
         location := locate_resource( db, area, .ARE )
         filename := fmt.aprintf( "%s.%s", area, RESType_TO_EXTENTION[ .ARE ] )
         defer delete( filename )
         fmt.printfln( "%s is in %s", filename, location )
-        #partial switch location {
+        switch location {
         case .Save:
             buf := db.sav.files[ filename ]
             are := load_ARE( buf ) or_return
-            defer delete( are.backing )
+            //defer delete( are.backing ) // only delete when also replacing
+            fmt.printfln( "TODO modify and write to .SAV" )
         case .Data:
-            fmt.printfln( "Loading from bif..." )
             for &res in db.key.resources {
                 if resref_move_to_string(&res.name) == area && res.type == .ARE {
                     path_bif := filepath.join( {PATH_GAME_BASE, get_Key_Resource_BIF_name( db, res ) } )
                     defer delete( path_bif )
                     bif := load_BIF( path_bif ) or_return
                     defer delete( bif.backing )
-                    fmt.printfln( "...loaded bif %s", get_Key_Resource_BIF_name( db, res ) )
+                    fmt.printfln( "TODO modify and write to .BIF %s", get_Key_Resource_BIF_name( db, res ) )
                     //TODO find file within BIF, load_ARE
                     //for bif_file in bif.files { fmt.printfln( "%v", bif_file ) }
                 }
             }
         case .Override:
             fmt.printfln( "Loading from override..." )
-            //TODO
+            path_override := filepath.join( {PATH_GAME_BASE, "override", filename} )
+            defer delete( path_override )
+            buf := os.read_entire_file_or_err( path_override ) or_return
+            are := load_ARE( buf ) or_return
+            defer delete( are.backing )
+            fmt.printfln( "TODO modify and write to override" )
+        case .DNE:
+            fmt.printfln( "Resource not found" )
         }
     }
     return
@@ -424,5 +431,5 @@ main :: proc() {
         return
     }
     defer delete_DB( &db )
-    update( db )
+    update_areas( db )
 }
