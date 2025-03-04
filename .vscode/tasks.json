@@ -52,7 +52,8 @@
 				"-resource:../doc/odin.rc",
 				"-collection:libs=../shared",
 				"-out:${workspaceFolderBasename}.exe",
-				"-debug"
+				"-debug",
+				"-extra-linker-flags:/ignore:4099 /LTCG",
 			],
 			"problemMatcher": [],
 			"group": {
