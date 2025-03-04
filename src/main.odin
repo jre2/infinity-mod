@@ -13,12 +13,12 @@ import rl "vendor:raylib"
 import zlib "vendor:zlib"
 
 DEBUG_MEMORY :: true
-PATH_GAME_BASE :: `D:\games\Infinity Engine\Icewind Dale Enhanced Edition`
-PATH_SAVE_BASE :: `C:\Users\rin\Documents\Icewind Dale - Enhanced Edition`
+PATH_GAME_BASE := `D:\games\Infinity Engine\Icewind Dale Enhanced Edition`
+PATH_SAVE_BASE := `C:\Users\rin\Documents\Icewind Dale - Enhanced Edition`
+SAVE_NAME := "000000047-all purchases but haste and intercession"
 
 /* .plan
 + load ARE from loose, BIF archive, or SAV archive, depending on location
-+ reconstruct SAV after modifying files; switch to vendor zlib so we can compress
 + save ARE file to loose (if BIF or override) or SAV archive (then reconstruct)
 FUTURE: support modifying ARE actors list; be able to reconstruct from scratch
 */
@@ -66,7 +66,7 @@ RESType :: enum u16 {
     EFF = 0x3f8, // usually instead just an embedded 30b in CRE,ITM,SPL files
     PVRZ = 0x404,
 }
-RESType_TO_EXTENTION := map[RESType]string { .ARE="are" }
+RESType_TO_EXTENTION := map[RESType]string { .ARE="are" } // add more as needed or find alternative
 Orientation :: enum u16 {
     South, SSW, SW, WSW, West, WNW, NW, NNW, North, NNE, NE, ENE, East, ESE, SE, SSE
 }
@@ -238,7 +238,7 @@ SAV_Header :: struct {
     version : [4]u8,
 }
 #assert( size_of(SAV_Header) == 8 )
-SAV_File :: struct {
+SAV_File :: struct { // not stored; just used for convenience
     len_filename : u32,
     filename : []u8,
     len_data_uncompressed : u32,
@@ -361,9 +361,9 @@ load_SAV :: proc( path: string ) -> (sav: SAV, err: Error) {
     }
     return
 }
-load_DB :: proc( path_game_base: string, save_name: string, debug: bool = true ) -> (db: DB, err: Error) {
-    path_key := filepath.join( {path_game_base, "chitin.key"} )
-    path_sav := filepath.join( {PATH_SAVE_BASE, "save", save_name, "BALDUR.SAV"} )
+load_DB :: proc() -> (db: DB, err: Error) {
+    path_key := filepath.join( {PATH_GAME_BASE, "chitin.key"} )
+    path_sav := filepath.join( {PATH_SAVE_BASE, "save", SAVE_NAME, "BALDUR.SAV"} )
     defer delete( path_key )
     defer delete( path_sav )
     db.key = load_KEY( path_key ) or_return
@@ -385,6 +385,7 @@ delete_DB :: proc( db: ^DB ) {
     delete( db.key.backing )
 }
 locate_resource :: proc( db: DB, resname: string, restype: RESType ) -> Location {
+    // some worries about case sensitivity
     filename := fmt.aprintf( "%s.%s", resname, RESType_TO_EXTENTION[ restype ] )
     defer delete( filename )
 
@@ -474,14 +475,14 @@ main :: proc() {
         fmt.printfln( "num actors: %d", len(area.actors) )
         fmt.printfln( "should be skeleton: actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
     }
-    db, err := load_DB( PATH_GAME_BASE, "000000047-all purchases but haste and intercession" )
+    db, err := load_DB()
     if err != nil {
         fmt.printfln( "Error loading game data: %v", err )
         return
     }
     defer delete_DB( &db )
     //update_areas( db )
-    path_save_test := filepath.join( {PATH_SAVE_BASE, "save", "000000047-all purchases but haste and intercession", "test.SAV"} )
+    path_save_test := filepath.join( {PATH_SAVE_BASE, "save", SAVE_NAME, "test.SAV"} )
     defer delete( path_save_test )
     if err = save_SAV( db.sav, path_save_test ); err != nil {
         fmt.printfln( "Error saving game data: %v", err )
