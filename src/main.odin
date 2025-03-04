@@ -18,9 +18,8 @@ PATH_SAVE_BASE := `C:\Users\rin\Documents\Icewind Dale - Enhanced Edition`
 SAVE_NAME := "000000047-all purchases but haste and intercession"
 
 /* .plan
-+ load ARE from loose, BIF archive, or SAV archive, depending on location
-+ save ARE file to loose (if BIF or override) or SAV archive (then reconstruct)
-FUTURE: support modifying ARE actors list; be able to reconstruct from scratch
+* modify .ARE rest encounters
+FUTURE: fully load .ARE files and rebuild from scratch (to enable changing number of Actors)
 */
 
 ZError :: enum i32 {
@@ -34,11 +33,15 @@ ZError :: enum i32 {
     BUF_ERROR = -5,
     VERSION_ERROR = -6,
 }
+ErrorIMod :: enum {
+    ResourceNotFound,
+}
 Error :: union #shared_nil {
     os.Error,
     odin_zlib.Error,
     ZError,
     mem.Allocator_Error,
+    ErrorIMod,
 }
 RESREF :: [8]u8
 Locator :: bit_field u32 {
@@ -75,6 +78,16 @@ Location :: enum {
     Data,
     Override,
     Save,
+}
+LocationData :: struct {
+    type : Location,
+    path_save_key : string,
+    path_override : string,
+    path_bif : string,
+    file_index_within_bif : u32,
+
+    path_save_file_new : string,
+    path_override_new : string,
 }
 
 ARE_Header :: struct {
@@ -304,6 +317,17 @@ load_ARE :: proc( buf: []u8 ) -> (are: ARE, err: Error) {
     assert( are.header.signature == "AREA", "Unexpected signature" )
     assert( are.header.version == "V1.0", "Unexpected version" )
     fmt.printfln( "header [%d] wed %s #actors %d", size_of(ARE_Header), are.header.wed_resource, are.header.num_actors )
+    are.actors = transmute( []ARE_Actor )are.backing[ are.header.offset_actors: ] [ :are.header.num_actors ]
+    fmt.printfln( "num actors: %d", len(are.actors) )
+    if len(are.actors) > 0 {
+        fmt.printfln( "first actor name %s cre %s", are.actors[0].name, are.actors[0].cre_file )
+    }
+    when false {
+        fmt.printfln( "actors block offset: %d", area.header.offset_actors )
+        fmt.printfln( "num actors: %d", area.header.num_actors )
+        fmt.printfln( "num actors: %d", len(area.actors) )
+        fmt.printfln( "should be skeleton: actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
+    }
     return
 }
 save_SAV :: proc( sav: SAV, path: string ) -> (err: Error) {
@@ -384,64 +408,88 @@ delete_DB :: proc( db: ^DB ) {
     delete( db.areas )
     delete( db.key.backing )
 }
-locate_resource :: proc( db: DB, resname: string, restype: RESType ) -> Location {
-    // some worries about case sensitivity
-    filename := fmt.aprintf( "%s.%s", resname, RESType_TO_EXTENTION[ restype ] )
-    defer delete( filename )
+update_area :: proc( db: DB, old: ARE ) -> (new: ARE, err: Error) {
+    // callee responsible for cleaning up memory of both old and new
+    new.backing = make( []u8, len(old.backing) )
+    return
+}
+locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: LocationData, err: Error) {
+    loc.path_save_key = fmt.aprintf( "%s.%s", res_name, RESType_TO_EXTENTION[ res_type ] )
+    loc.path_override = filepath.join( {PATH_GAME_BASE, "override", loc.path_save_key} )
+    loc.path_bif = fmt.aprintf( "dummy" ) // for consistent memory free logic
 
-    if filename in db.sav.files {
-        return .Save
-    }
-    path_override := filepath.join( {PATH_GAME_BASE, "override", filename} )
-    defer delete( path_override )
-    if os.exists( path_override ) {
-        return .Override
-    }
+    loc.path_save_file_new = fmt.aprintf( "dummy.%s.sav", loc.path_save_key )
+    loc.path_override_new = fmt.aprintf( "%s.jmrbak", loc.path_override )
+
     for &res in db.key.resources {
-        if resref_move_to_string(&res.name) == resname && res.type == restype {
-            return .Data
+        if resref_move_to_string(&res.name) == res_name && res.type == res_type {
+            delete( loc.path_bif )
+            loc.path_bif = filepath.join( {PATH_GAME_BASE, get_Key_Resource_BIF_name( db, res ) } )
+            loc.file_index_within_bif = res.loc.file
+            loc.type = .Data
+            break
         }
     }
-    return .DNE
+    assert( loc.type == .Data, "Resource not found in BIFs, which should be impossible" )
+    if os.exists( loc.path_override ) {
+        loc.type = .Override
+    }
+    if loc.path_save_key in db.sav.files {
+        loc.type = .Save
+    }
+    assert( loc.type != .DNE, "Resource not found in any location" )
+    return
 }
-update_areas :: proc( db: DB ) -> (err: Error){
-    for area in db.areas {
-        //if area != "AR1201" { continue } // SAV
-        if area != "AR2102" { continue } // override
-        //if area != "AR2003" { continue } // BIF
+delete_LocationData :: proc( loc: ^LocationData ) {
+    delete( loc.path_save_key )
+    delete( loc.path_override )
+    delete( loc.path_bif )
 
-        location := locate_resource( db, area, .ARE )
-        filename := fmt.aprintf( "%s.%s", area, RESType_TO_EXTENTION[ .ARE ] )
-        defer delete( filename )
-        fmt.printfln( "%s is in %s", filename, location )
-        switch location {
-        case .Save:
-            buf := db.sav.files[ filename ]
-            are := load_ARE( buf ) or_return
-            //defer delete( are.backing ) // only delete when also replacing
-            fmt.printfln( "TODO modify and write to .SAV" )
+    delete( loc.path_save_file_new )
+    delete( loc.path_override_new )
+}
+update_areas :: proc( db: ^DB ) -> (err: Error){
+    for area in db.areas {
+        //if true { continue }
+        //if area != "AR1201" { continue } // SAV
+        //if area != "AR2102" { continue } // override
+        if area != "AR2003" { continue } // BIF
+
+        loc := locate_resource( db^, area, .ARE ) or_return
+        defer delete_LocationData( &loc )
+
+        switch loc.type {
         case .Data:
-            for &res in db.key.resources {
-                if resref_move_to_string(&res.name) == area && res.type == .ARE {
-                    path_bif := filepath.join( {PATH_GAME_BASE, get_Key_Resource_BIF_name( db, res ) } )
-                    defer delete( path_bif )
-                    bif := load_BIF( path_bif ) or_return
-                    defer delete( bif.backing )
-                    fmt.printfln( "TODO modify and write to .BIF %s", get_Key_Resource_BIF_name( db, res ) )
-                    //TODO find file within BIF, load_ARE
-                    //for bif_file in bif.files { fmt.printfln( "%v", bif_file ) }
-                }
-            }
+            bif := load_BIF( loc.path_bif ) or_return
+            defer delete( bif.backing )
+            bif_file := bif.files[ loc.file_index_within_bif ]
+            bif_file_buf := bif.backing[ bif_file.offset:bif_file.offset+bif_file.size ]
+            are_old := load_ARE( bif_file_buf ) or_return
+
+            are_new := update_area( db^, are_old ) or_return
+            defer delete( are_new.backing )
+            
+            os.write_entire_file_or_err( loc.path_override_new, are_new.backing ) or_return
         case .Override:
-            fmt.printfln( "Loading from override..." )
-            path_override := filepath.join( {PATH_GAME_BASE, "override", filename} )
-            defer delete( path_override )
-            buf := os.read_entire_file_or_err( path_override ) or_return
-            are := load_ARE( buf ) or_return
-            defer delete( are.backing )
-            fmt.printfln( "TODO modify and write to override" )
+            buf := os.read_entire_file_or_err( loc.path_override ) or_return
+            are_old := load_ARE( buf ) or_return // owned as buf and are_old.backing
+            defer delete( are_old.backing )
+
+            are_new := update_area( db^, are_old ) or_return
+            defer delete( are_new.backing )
+
+            os.write_entire_file_or_err( loc.path_override_new, are_new.backing ) or_return
+        case .Save:
+            buf := db.sav.files[ loc.path_save_key ]
+            are_old := load_ARE( buf ) or_return // memory owned by db.sav, so delete iff replacing
+
+            are_new := update_area( db^, are_old ) or_return
+            delete( are_old.backing ) // cleanup old but db.sav is responsible for deleting new later on
+            db.sav.files[ loc.path_save_key ] = are_new.backing
+
+            save_SAV( db.sav, loc.path_save_file_new ) or_return
         case .DNE:
-            fmt.printfln( "Resource not found" )
+            panic( "Should not have reached here" )
         }
     }
     return
@@ -463,29 +511,26 @@ main :: proc() {
         defer { print_alloc_stats( &tracking_allocator ) }
     }
 
-    when false {
-        area.backing = file_data
-        area.header = slice.to_type( area.backing[0:], ARE_Header )
-        assert( area.header.signature == "AREA", "Unexpected signature" )
-        assert( area.header.version == "V1.0", "Unexpected version" )
-
-        fmt.printfln( "actors block offset: %d", area.header.offset_actors )
-        fmt.printfln( "num actors: %d", area.header.num_actors )
-        area.actors = transmute( []ARE_Actor )area.backing[ area.header.offset_actors: ] [ :area.header.num_actors ]
-        fmt.printfln( "num actors: %d", len(area.actors) )
-        fmt.printfln( "should be skeleton: actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
-    }
     db, err := load_DB()
     if err != nil {
         fmt.printfln( "Error loading game data: %v", err )
         return
     }
     defer delete_DB( &db )
-    //update_areas( db )
-    path_save_test := filepath.join( {PATH_SAVE_BASE, "save", SAVE_NAME, "test.SAV"} )
-    defer delete( path_save_test )
-    if err = save_SAV( db.sav, path_save_test ); err != nil {
-        fmt.printfln( "Error saving game data: %v", err )
-        return
+
+    when true { // update areas
+        err = update_areas( &db )
+        if err != nil {
+            fmt.printfln( "Error updating areas: %v", err )
+            return
+        }
+    }
+    when false { // save test
+        path_save_test := filepath.join( {PATH_SAVE_BASE, "save", SAVE_NAME, "test.SAV"} )
+        defer delete( path_save_test )
+        if err = save_SAV( db.sav, path_save_test ); err != nil {
+            fmt.printfln( "Error saving game data: %v", err )
+            return
+        }
     }
 }
