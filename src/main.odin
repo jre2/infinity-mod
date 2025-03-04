@@ -8,7 +8,9 @@ import "core:mem"
 import "core:path/filepath"
 import "core:os"
 import "core:slice"
+import "core:strings"
 import rl "vendor:raylib"
+import zlib "vendor:zlib"
 
 DEBUG_MEMORY :: true
 PATH_GAME_BASE :: `D:\games\Infinity Engine\Icewind Dale Enhanced Edition`
@@ -21,9 +23,22 @@ PATH_SAVE_BASE :: `C:\Users\rin\Documents\Icewind Dale - Enhanced Edition`
 FUTURE: support modifying ARE actors list; be able to reconstruct from scratch
 */
 
+ZError :: enum i32 {
+    OK = 0,
+    STREAM_END = 1,
+    NEED_DICT = 2,
+    ERRNO = -1,
+    STREAM_ERROR = -2,
+    DATA_ERROR = -3,
+    MEM_ERROR = -4,
+    BUF_ERROR = -5,
+    VERSION_ERROR = -6,
+}
 Error :: union #shared_nil {
     os.Error,
     odin_zlib.Error,
+    ZError,
+    mem.Allocator_Error,
 }
 RESREF :: [8]u8
 Locator :: bit_field u32 {
@@ -291,6 +306,33 @@ load_ARE :: proc( buf: []u8 ) -> (are: ARE, err: Error) {
     fmt.printfln( "header [%d] wed %s #actors %d", size_of(ARE_Header), are.header.wed_resource, are.header.num_actors )
     return
 }
+save_SAV :: proc( sav: SAV, path: string ) -> (err: Error) {
+    sav := sav
+    fd := os.open( path, os.O_CREATE ) or_return
+    defer os.close( fd )
+
+    os.write_ptr( fd, &sav.header, size_of( SAV_Header ) ) or_return
+    for filename, data_uncompressed in sav.files {
+        // len filename, filename ; null terminate it
+        len_filename := cast(u32)len(filename) +1
+        os.write_ptr( fd, &len_filename, size_of( u32 ) ) or_return
+        os.write_ptr( fd, raw_data(filename), len(filename) ) or_return
+        os.write_byte( fd, 0 ) or_return
+
+        // len uncomp, len comp, comp data
+        len_uncompressed := cast(u32)len(data_uncompressed)
+        len_compressed := len_uncompressed // reasonable upper bound on buffer required
+        data_compressed := make( []u8, len_compressed )
+        defer delete( data_compressed )
+        zerr := zlib.compress2( raw_data(data_compressed), &len_compressed, raw_data(data_uncompressed), len_uncompressed, 9 )
+        if zerr < 0 { return ZError( zerr ) }
+
+        os.write_ptr( fd, &len_uncompressed, size_of( u32 ) ) or_return
+        os.write_ptr( fd, &len_compressed, size_of( u32 ) ) or_return
+        os.write_ptr( fd, raw_data(data_compressed), cast(int)len_compressed ) or_return
+    }
+    return
+}
 load_SAV :: proc( path: string ) -> (sav: SAV, err: Error) {
     sav.backing = os.read_entire_file_or_err( path ) or_return
     sav.header = slice.to_type( sav.backing[0:], SAV_Header )
@@ -306,9 +348,16 @@ load_SAV :: proc( path: string ) -> (sav: SAV, err: Error) {
         savfile.len_data_compressed = slice.to_type( sav.backing[i:i+4], u32 ); i+=4
         savfile.data_compressed = sav.backing[i:i+savfile.len_data_compressed]; i+=savfile.len_data_compressed
 
+        // odin implementation
         zbuf : bytes.Buffer
         odin_zlib.inflate( savfile.data_compressed, &zbuf ) or_return
         sav.files[ string(savfile.filename[: len(savfile.filename)-1]) ] = bytes.buffer_to_bytes( &zbuf )
+        /*
+        dest_len : u32 = savfile.len_data_uncompressed
+        dest := make( []u8, savfile.len_data_uncompressed )
+        zerr := zlib.uncompress( raw_data(dest), &dest_len, raw_data(savfile.data_compressed), savfile.len_data_compressed )
+        if zerr < 0 { return sav, ZError( zerr ) }
+        */
     }
     return
 }
@@ -431,5 +480,11 @@ main :: proc() {
         return
     }
     defer delete_DB( &db )
-    update_areas( db )
+    //update_areas( db )
+    path_save_test := filepath.join( {PATH_SAVE_BASE, "save", "000000047-all purchases but haste and intercession", "test.SAV"} )
+    defer delete( path_save_test )
+    if err = save_SAV( db.sav, path_save_test ); err != nil {
+        fmt.printfln( "Error saving game data: %v", err )
+        return
+    }
 }
