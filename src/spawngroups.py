@@ -8,9 +8,10 @@ from   math import floor
 PATH_GAME_BASE = r'D:\games\Infinity Engine\Icewind Dale Enhanced Edition'
 path_pristine = PATH_GAME_BASE + '/override.pristine/SPAWNGRP.2da'
 path_output = PATH_GAME_BASE + '/override/SPAWNGRP.2da'
+DEFAULT_DIFFICULTY = 10 # 10=25/15, 20=15/15, 30=9/15, 40=8/15, 50=9/15, 70=1/15
 manual = '''
-#AR1200 ORCWAXE ORCWBOW ORCEWAXE ORCSHAM OGRE * * *
-#AR1200 ORCWAXE ORCWBOW ORCEWAXE ORCSHAM OGRE * * *
+#AR1200 100 ORCWAXE ORCWBOW ORCEWAXE ORCSHAM OGRE * * *
+#AR1200 100 ORCWAXE ORCWBOW ORCEWAXE ORCSHAM OGRE * * *
 '''
 
 # Convert enemy list into spawngroup slots
@@ -392,9 +393,9 @@ def load_2da( path ):
         for x, col in enumerate( line.split() ):
             if y == 0: # spawn group name
                 groups[x] = { 'name': col, 'diff': 'dummy', 'creatures': [] }
-            elif y == 1: # difficulty
+            elif y == 1: # difficulty row
                 groups[x]['diff'] = col
-            elif y > 1: # creature slot
+            elif y > 1: # creature slots
                 groups[x]['creatures'].append( col )
     groups[0]['name'] = ''
 
@@ -437,6 +438,9 @@ def update_groups( groups ):
     # find all _reasonable_ enemies for the area, duplicates according to frequency
     areas = {} # :: Map AreaName -> [?]CreatureName
     creatures = {} # :: Map CreatureName -> [ActorStats]
+    spawns = {} # :: Map AreaName -> [8]CreatureName
+    difficulty = {} # :: Map AreaName -> Diff
+
     for actor in data:
         area_name = actor['area']
         actor_name = actor['creature_file']
@@ -452,7 +456,6 @@ def update_groups( groups ):
         areas[ area_name ].append( actor_name )
 
     # calculate slots for each area based on frequency analysis
-    spawns = {} # :: Map AreaName -> [8]CreatureName
     for area in areas:
         mobs = areas[ area ]
 
@@ -471,10 +474,13 @@ def update_groups( groups ):
     # override with manual data when possible
     for line in manual.split( '\n' ):
         if not line.split('#')[0]: continue
-        area, *creatures = line.split()
+        area, diff, *creatures = line.split()
+        diff = int(diff)
+        assert 1 < diff < 50000, f"Invalid difficulty {diff}"
         assert area in spawns, f"Unknown area {area}"
         assert len( creatures ) == 8, f"Expected 8 creatures for {area}"
         spawns[ area ] = creatures
+        difficulty[ area ] = diff
     
     # display
     for area in spawns:
@@ -499,7 +505,7 @@ def update_groups( groups ):
     # update groups
     for area in spawns:
         group_name = f'RD{area}'
-        groups[ group_name ] = { 'name': group_name, 'diff': '100', 'creatures': spawns[ area ] }
+        groups[ group_name ] = { 'name': group_name, 'diff': str( difficulty.get(area, DEFAULT_DIFFICULTY) ), 'creatures': spawns[ area ] }
 
 groups = load_2da( path_pristine )
 update_groups( groups )
