@@ -3,11 +3,13 @@ package main
 
 import "core:bytes"
 import odin_zlib "core:compress/zlib"
+import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:path/filepath"
 import "core:os"
 import "core:slice"
+import "core:strings"
 import zlib "vendor:zlib"
 
 DEBUG_MEMORY :: true
@@ -21,16 +23,8 @@ SAVE_NAME := "000000047-all purchases but haste and intercession"
 FUTURE: fully load .ARE files and rebuild from scratch (to enable changing number of Actors)
 NOTE: struct .header sections are not linked to backing buffer; they are copies. might want to change later
 
-for each area
-    for each actor/rest creature
-        determine if hostile -- load .CRE file and check for hostile flag, also check if in spawngrp?
-        tick frequency of occurance
-    -- Map CreatureName -> CreatureData (frequency, hostile, power level)
-    replace rest encounters with spawngrp entry
--- Map AreaName -> (Map CreatureName -> CreatureData)
-write all that data out as json
-
-# then, python program generates spawngrp.2DA
+TODO: replace rest_encounters with spawngrp reference
+TODO: python program to generate spawngrp.2DA
 */
 
 ZError :: enum i32 {
@@ -45,6 +39,7 @@ ZError :: enum i32 {
     VERSION_ERROR = -6,
 }
 ErrorIMod :: enum {
+    OK,
     ResourceNotFound,
 }
 Error :: union #shared_nil {
@@ -52,6 +47,7 @@ Error :: union #shared_nil {
     odin_zlib.Error,
     ZError,
     mem.Allocator_Error,
+    json.Marshal_Error,
     ErrorIMod,
 }
 RESREF :: [8]u8
@@ -111,6 +107,27 @@ LocationData :: struct {
     path_save_file_new : string,
     path_override_new : string,
 }
+EnemyAlly :: enum u8 {
+    Unknown = 0,
+    Inanimate = 1,
+    PC = 2,
+    Familiar = 3,
+    Ally = 4,
+    Controlled = 5,
+    Charmed = 6,
+    GoodButRed = 28,
+    GoodButBlue = 29,
+    GoodCutOff = 30,
+    NotGood = 31,
+    Anything = 126,
+    Neutral = 128,
+    NotNeutral = 198, // used by neutrals targetting with enemy-only spells
+    NotEvil = 199,
+    EvilCutOff = 200,
+    EvilButGreen = 201,
+    EvilButBlue = 202,
+    Enemy = 255,
+}
 
 CRE_Header :: struct {
     signature : [4]u8,
@@ -127,7 +144,7 @@ CRE_Header :: struct {
     _ignored1 : [0x20c]u8,
     levels : [3]u8,
     _ignored2 : [0x39]u8,
-    allegience : u8,
+    allegience : EnemyAlly,
 }
 #assert(offset_of(CRE_Header, hp_max) == 0x26)
 #assert(offset_of(CRE_Header, levels) == 0x234)
@@ -328,11 +345,31 @@ SAV :: struct {
     files : map[string][]u8,
 }
 
+ActorStat :: struct {
+    area : string, // ex AR1201
+    creature_file : string,
+    in_actors_list : bool, // if not, Actor section is garbage
+    found_cre_file : bool, // if not .CRE section is garbage
+
+    // Actor (iff in actors list)
+    display_name : string,
+    position_cur : [2]u16,
+    position_dest : [2]u16,
+    is_random_spawn : bool,
+
+    // .CRE (iff found)
+    hp_max : u16,
+    power_level : u32,
+    class_levels : [3]u8,
+    hostile : bool,
+    allegience : EnemyAlly,
+}
 DB :: struct {
     key : KEY,
     sav : SAV,
-    // convienence and not automatically kept in sync
-    areas: [dynamic]string, // resource names for .ARE files
+
+    areas: [dynamic]string, // resource names for .ARE files; not auto synced with KEY
+    actor_stats : [dynamic]ActorStat,
 }
 
 get_KEY_BIF_name :: proc( db: DB, keybif: KEY_BIF ) -> string {
@@ -340,6 +377,10 @@ get_KEY_BIF_name :: proc( db: DB, keybif: KEY_BIF ) -> string {
 }
 resref_move_to_string :: proc( resref: ^RESREF ) -> string {
     return string( bytes.trim_right_null( resref[:] ) )
+}
+resref_copy_to_string :: proc( resref: RESREF ) -> string {
+    resref := resref
+    return strings.clone( string( bytes.trim_right_null( resref[:] ) ) )
 }
 get_Key_Resource_BIF_name :: proc( db: DB, res: KEY_Resource ) -> string {
     return get_KEY_BIF_name( db, db.key.bifs[ res.loc.bif ] )
@@ -483,10 +524,21 @@ delete_DB :: proc( db: ^DB ) {
     delete_SAV( db.sav )
     delete( db.areas )
     delete( db.key.backing )
+    for &actor_stat in db.actor_stats {
+        delete_ActorStat( &actor_stat )
+    }
+    delete( db.actor_stats )
 }
 delete_Resource :: proc( res: ^Resource ) {
     delete_LocationData( &res.loc )
     delete( res.backing )
+}
+delete_ActorStat :: proc( stat: ^ActorStat ) {
+    delete( stat.area )
+    delete( stat.creature_file )
+    if stat.in_actors_list {
+        delete( stat.display_name )
+    }
 }
 
 lookup_RES :: proc( db: DB, res_name:string, res_type:RESType, use_pristine:bool = false ) -> (res: Resource, err: Error) {
@@ -540,33 +592,78 @@ update_areas :: proc( db: ^DB ) -> (err: Error) {
         actual := lookup_RES( db^, area, .ARE ) or_return
         defer delete_Resource( &actual )
 
-        are_new := update_area( db^, pristine.res.(ARE), actual.res.(ARE) ) or_return
+        are_new := update_area( db, pristine.res.(ARE), actual.res.(ARE) ) or_return
         defer delete( are_new.backing )
 
         save_RES( db, are_new.backing, actual.loc, write_save=false ) or_return
     }
     save_SAV( db.sav, "dummy.sav" ) or_return // batch all the .SAV file changes
+
+    // write actor stats to json
+    jbytes := json.marshal( db.actor_stats ) or_return
+    defer delete( jbytes )
+    os.write_entire_file_or_err( "actor_stats.json", jbytes ) or_return
     return
 }
 
-update_area :: proc( db: DB, pristine: ARE, old: ARE ) -> (new: ARE, err: Error) {
-    // callee responsible for cleaning up memory of both old and new
+add_creature_data :: proc( db: DB, stat: ^ActorStat ) -> (err: Error) {
+    // if the resource is missing, assume it's from a mod (with case sensitivity issues) and it's hostile
+    res := lookup_RES( db, stat.creature_file, .CRE, use_pristine=true ) or_return
+    defer delete_Resource( &res )
+    creh := res.res.(CRE).header
+
+    stat.found_cre_file = true
+    stat.hp_max = creh.hp_max
+    stat.power_level = creh.power_level
+    stat.class_levels = creh.levels
+    stat.hostile = creh.allegience == .Enemy
+    stat.allegience = creh.allegience
+    return
+}
+update_area :: proc( db: ^DB, pristine: ARE, old: ARE ) -> (new: ARE, err: Error) {
+    // callee responsible for cleaning up memory of old, new, and pristine
     new = load_ARE( bytes.clone( old.backing ) ) or_return
 
-    //TODO: calculate new values based on pristine reference data rather than current values
-    new.rest_encounters.max_creature_spawns = clamp( new.rest_encounters.max_creature_spawns * 5, 10, 30 )
-    // could change spawn probability to 150% but unsure if desired
-    // could adjust encounter difficulty; reduce to create more enemies at lower party level/size
+    // How many monsters will spawn? sometimes less than this due to encounter difficulty or spawngroup difficulty
+    new.rest_encounters.max_creature_spawns = clamp( pristine.rest_encounters.max_creature_spawns * 5, 10, 30 )
 
-    //TODO collect creature stats and record
-    //fmt.printfln( "Rest Encounter: %s", new.header.wed_resource )
-    for &cre in new.rest_encounters.creature_refs {
+    // Hourly (while sleeping) chance of ambush. Higher than 10-12%/hr seems brutal
+    new.rest_encounters.spawn_probability_per_hour_day = clamp( u16( f32(pristine.rest_encounters.spawn_probability_per_hour_day) * 1.00 ), 1, 12 )
+    new.rest_encounters.spawn_probability_per_hour_night = clamp( u16( f32(pristine.rest_encounters.spawn_probability_per_hour_night) * 1.00 ), 1, 12 )
+
+    // Based on encounter difficulty vs spawn difficulty vs party average lvl/size, sometimes spawn fewer than maximum enemies
+    //new.rest_encounters.difficulty = clamp( u16( f32(pristine.rest_encounters.difficulty) * 1.00 ), 1, 21 )
+
+    // collect creature stats for external analysis
+    for &actor in pristine.actors {
+        stat : ActorStat
+        stat.area = resref_copy_to_string( new.header.wed_resource )
+        stat.creature_file = resref_copy_to_string( actor.cre_file )
+
+        stat.in_actors_list = true
+        stat.display_name = strings.clone( string( bytes.trim_right_null( actor.name[:] ) ) )
+        stat.position_cur = actor.coord_cur
+        stat.position_dest = actor.coord_dest
+        stat.is_random_spawn = actor.is_random == 1
+
+        add_creature_data( db^, &stat )
+        append( &db.actor_stats, stat )
+    }
+    for &cre in pristine.rest_encounters.creature_refs {
         if cre[0] == 0 { continue }
-        //fmt.printfln( "    %s", resref_move_to_string( &cre ) )
+
+        stat : ActorStat
+        stat.area = resref_copy_to_string( new.header.wed_resource )
+        stat.creature_file = resref_copy_to_string( cre )
+
+        add_creature_data( db^, &stat )
+        append( &db.actor_stats, stat )
     }
     return
 }
 locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: LocationData, err: Error) {
+    //NOTE: it is possible for a resource to not exist in .Data but only in .Override/Save; if it's non-vanilla content added by a mod
+    // if DNE, loc memory will be freed for you
     loc.path_save_key = fmt.aprintf( "%s.%s", res_name, RESType_TO_EXTENTION[ res_type ] )
     loc.path_override = filepath.join( {PATH_GAME_BASE, PATH_REL_OVERRIDE_READ, loc.path_save_key} )
     loc.path_bif = fmt.aprintf( "dummy" ) // for consistent memory free logic
@@ -584,7 +681,6 @@ locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: 
             break
         }
     }
-    assert( loc.type == .Data, "Resource not found in BIFs, which should be impossible" )
     if os.exists( loc.path_override ) {
         loc.type = .Override
         loc.type_pristine = .Override
@@ -592,7 +688,10 @@ locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: 
     if loc.path_save_key in db.sav.files {
         loc.type = .Save
     }
-    assert( loc.type != .DNE, "Resource not found in any location" )
+    if loc.type == .DNE {
+        delete_LocationData( &loc )
+        return loc, .ResourceNotFound
+    }
     return
 }
 
