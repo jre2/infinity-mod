@@ -1,2 +1,4 @@
 bin/*.exe
 bin/*.pdb
+bin/*.sav
+bin/*.bin
