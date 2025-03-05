@@ -15,11 +15,13 @@ import zlib "vendor:zlib"
 DEBUG_MEMORY :: true
 PATH_GAME_BASE := `D:\games\Infinity Engine\Icewind Dale Enhanced Edition`
 PATH_SAVE_BASE := `C:\Users\rin\Documents\Icewind Dale - Enhanced Edition`
+PATH_REL_OVERRIDE_READ := "override.pristine"
+PATH_REL_OVERRIDE_WRITE := "override"
 SAVE_NAME := "000000047-all purchases but haste and intercession"
 
 /* .plan
-* modify .ARE rest encounters
 FUTURE: fully load .ARE files and rebuild from scratch (to enable changing number of Actors)
+NOTE: struct .header sections are not linked to backing buffer; they are copies. might want to change later
 */
 
 ZError :: enum i32 {
@@ -44,6 +46,7 @@ Error :: union #shared_nil {
     ErrorIMod,
 }
 RESREF :: [8]u8
+STRREF :: u32
 Locator :: bit_field u32 {
     file: u32 | 14, // non-tileset file index (any 12bit value so long as it matches value in BIF)
     tileset: u32 | 6, // tileset index
@@ -179,10 +182,26 @@ ARE_Actor :: struct {
     size_cre_struct : u32,
     unused3 : [128]u8,
 }
+ARE_RestEncounter :: struct {
+    name : [32]u8,
+    creature_strings: [10]STRREF,
+    creature_refs: [10]RESREF,
+    creature_count : u16,
+    difficulty : u16,
+    removal_time: u32, // duration
+    distance_wander : u16,
+    distance_follow : u16,
+    max_creature_spawns : u16,
+    is_active : u16, // 0 inactive 1 active
+    spawn_probability_per_hour_day : u16,
+    spawn_probability_per_hour_night : u16,
+    unused : [56]u8,
+}
 ARE :: struct {
     backing : []u8,
     header : ARE_Header,
     actors : []ARE_Actor,
+    rest_encounters : ^ARE_RestEncounter,
 }
 
 BIF_Header :: struct {
@@ -316,23 +335,13 @@ load_ARE :: proc( buf: []u8 ) -> (are: ARE, err: Error) {
     are.header = slice.to_type( are.backing[0:], ARE_Header )
     assert( are.header.signature == "AREA", "Unexpected signature" )
     assert( are.header.version == "V1.0", "Unexpected version" )
-    fmt.printfln( "header [%d] wed %s #actors %d", size_of(ARE_Header), are.header.wed_resource, are.header.num_actors )
     are.actors = transmute( []ARE_Actor )are.backing[ are.header.offset_actors: ] [ :are.header.num_actors ]
-    fmt.printfln( "num actors: %d", len(are.actors) )
-    if len(are.actors) > 0 {
-        fmt.printfln( "first actor name %s cre %s", are.actors[0].name, are.actors[0].cre_file )
-    }
-    when false {
-        fmt.printfln( "actors block offset: %d", area.header.offset_actors )
-        fmt.printfln( "num actors: %d", area.header.num_actors )
-        fmt.printfln( "num actors: %d", len(area.actors) )
-        fmt.printfln( "should be skeleton: actor name %s cre %s", area.actors[41].name, area.actors[41].cre_file )
-    }
+    are.rest_encounters = cast(^ARE_RestEncounter) raw_data( are.backing[ are.header.offset_rest_encounters: ] )
     return
 }
 save_SAV :: proc( sav: SAV, path: string ) -> (err: Error) {
     sav := sav
-    fd := os.open( path, os.O_CREATE ) or_return
+    fd := os.open( path, os.O_CREATE | os.O_WRONLY | os.O_TRUNC ) or_return
     defer os.close( fd )
 
     os.write_ptr( fd, &sav.header, size_of( SAV_Header ) ) or_return
@@ -364,7 +373,7 @@ load_SAV :: proc( path: string ) -> (sav: SAV, err: Error) {
     assert( sav.header.version == "V1.0", "Unexpected version" )
 
     i : u32 = size_of( SAV_Header )
-    for i < cast(u32) len(sav.backing) {
+    for len(sav.backing) - int(i) > 0xC { // File Entry must have 3x u32 lengths (and a filename but theoretically could be 0-length)
         savfile : SAV_File
         savfile.len_filename = slice.to_type( sav.backing[i:i+4], u32 ); i+=4
         savfile.filename = sav.backing[i:i+savfile.len_filename]; i+=savfile.len_filename
@@ -372,16 +381,20 @@ load_SAV :: proc( path: string ) -> (sav: SAV, err: Error) {
         savfile.len_data_compressed = slice.to_type( sav.backing[i:i+4], u32 ); i+=4
         savfile.data_compressed = sav.backing[i:i+savfile.len_data_compressed]; i+=savfile.len_data_compressed
 
-        // odin implementation
+        // odin zlib implementation
         zbuf : bytes.Buffer
         odin_zlib.inflate( savfile.data_compressed, &zbuf ) or_return
         sav.files[ string(savfile.filename[: len(savfile.filename)-1]) ] = bytes.buffer_to_bytes( &zbuf )
-        /*
+        /* vendor zlib implementation
         dest_len : u32 = savfile.len_data_uncompressed
         dest := make( []u8, savfile.len_data_uncompressed )
         zerr := zlib.uncompress( raw_data(dest), &dest_len, raw_data(savfile.data_compressed), savfile.len_data_compressed )
         if zerr < 0 { return sav, ZError( zerr ) }
         */
+    }
+    remaining_bytes := len(sav.backing) - int(i)
+    if remaining_bytes != 0 {
+        fmt.printfln( "Warning: SAV has %d bytes remaining at the end", remaining_bytes )
     }
     return
 }
@@ -399,27 +412,32 @@ load_DB :: proc() -> (db: DB, err: Error) {
     }
     return
 }
-delete_DB :: proc( db: ^DB ) {
-    for key, value in db.sav.files {
-        delete( db.sav.files[ key ] )
+delete_SAV :: proc( sav: SAV ) {
+    for key, value in sav.files {
+        delete( sav.files[ key ] )
     }
-    delete( db.sav.files )
-    delete( db.sav.backing )
+    delete( sav.files )
+    delete( sav.backing )
+}
+delete_DB :: proc( db: ^DB ) {
+    delete_SAV( db.sav )
     delete( db.areas )
     delete( db.key.backing )
 }
 update_area :: proc( db: DB, old: ARE ) -> (new: ARE, err: Error) {
     // callee responsible for cleaning up memory of both old and new
-    new.backing = make( []u8, len(old.backing) )
+    new = load_ARE( bytes.clone( old.backing ) ) or_return
+    new.rest_encounters.max_creature_spawns = 17
+    //fmt.printfln( "Max spawns %d -> %d", old.rest_encounters.max_creature_spawns, new.rest_encounters.max_creature_spawns )
     return
 }
 locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: LocationData, err: Error) {
     loc.path_save_key = fmt.aprintf( "%s.%s", res_name, RESType_TO_EXTENTION[ res_type ] )
-    loc.path_override = filepath.join( {PATH_GAME_BASE, "override", loc.path_save_key} )
+    loc.path_override = filepath.join( {PATH_GAME_BASE, PATH_REL_OVERRIDE_READ, loc.path_save_key} )
     loc.path_bif = fmt.aprintf( "dummy" ) // for consistent memory free logic
 
-    loc.path_save_file_new = fmt.aprintf( "dummy.%s.sav", loc.path_save_key )
-    loc.path_override_new = fmt.aprintf( "%s.jmrbak", loc.path_override )
+    loc.path_save_file_new = fmt.aprintf( "dummy.sav" )
+    loc.path_override_new = filepath.join( {PATH_GAME_BASE, PATH_REL_OVERRIDE_WRITE, loc.path_save_key} )
 
     for &res in db.key.resources {
         if resref_move_to_string(&res.name) == res_name && res.type == res_type {
@@ -450,11 +468,6 @@ delete_LocationData :: proc( loc: ^LocationData ) {
 }
 update_areas :: proc( db: ^DB ) -> (err: Error){
     for area in db.areas {
-        //if true { continue }
-        //if area != "AR1201" { continue } // SAV
-        //if area != "AR2102" { continue } // override
-        if area != "AR2003" { continue } // BIF
-
         loc := locate_resource( db^, area, .ARE ) or_return
         defer delete_LocationData( &loc )
 
@@ -485,13 +498,17 @@ update_areas :: proc( db: ^DB ) -> (err: Error){
 
             are_new := update_area( db^, are_old ) or_return
             delete( are_old.backing ) // cleanup old but db.sav is responsible for deleting new later on
-            db.sav.files[ loc.path_save_key ] = are_new.backing
 
-            save_SAV( db.sav, loc.path_save_file_new ) or_return
+            db.sav.files[ loc.path_save_key ] = are_new.backing
+            // single combined write to save file will occur after loop
         case .DNE:
             panic( "Should not have reached here" )
         }
     }
+    // save any modifications to the SAV file
+    save_SAV( db.sav, "dummy.sav" ) or_return
+    new_sav := load_SAV( "dummy.sav" ) or_return // sanity check we can load our own save file
+    delete_SAV( new_sav )
     return
 }
 main :: proc() {
@@ -522,14 +539,6 @@ main :: proc() {
         err = update_areas( &db )
         if err != nil {
             fmt.printfln( "Error updating areas: %v", err )
-            return
-        }
-    }
-    when false { // save test
-        path_save_test := filepath.join( {PATH_SAVE_BASE, "save", SAVE_NAME, "test.SAV"} )
-        defer delete( path_save_test )
-        if err = save_SAV( db.sav, path_save_test ); err != nil {
-            fmt.printfln( "Error saving game data: %v", err )
             return
         }
     }
