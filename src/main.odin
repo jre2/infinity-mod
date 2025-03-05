@@ -22,9 +22,7 @@ SAVE_NAME := "000000047-all purchases but haste and intercession"
 /* .plan
 FUTURE: fully load .ARE files and rebuild from scratch (to enable changing number of Actors)
 NOTE: struct .header sections are not linked to backing buffer; they are copies. might want to change later
-
-TODO: replace rest_encounters with spawngrp reference
-TODO: python program to generate spawngrp.2DA
+KNOWN ISSUE: replace all trim_right_null with proper cut off at null terminator logic
 */
 
 ZError :: enum i32 {
@@ -592,9 +590,11 @@ update_areas :: proc( db: ^DB ) -> (err: Error) {
         actual := lookup_RES( db^, area, .ARE ) or_return
         defer delete_Resource( &actual )
 
-        are_new := update_area( db, pristine.res.(ARE), actual.res.(ARE) ) or_return
+        are_new, new_pristine := update_area( db, pristine.res.(ARE), actual.res.(ARE) ) or_return
         defer delete( are_new.backing )
+        defer delete( new_pristine.backing )
 
+        save_RES( db, new_pristine.backing, pristine.loc, use_pristine=true, write_save=false ) or_return
         save_RES( db, are_new.backing, actual.loc, write_save=false ) or_return
     }
     save_SAV( db.sav, "dummy.sav" ) or_return // batch all the .SAV file changes
@@ -620,9 +620,13 @@ add_creature_data :: proc( db: DB, stat: ^ActorStat ) -> (err: Error) {
     stat.allegience = creh.allegience
     return
 }
-update_area :: proc( db: ^DB, pristine: ARE, old: ARE ) -> (new: ARE, err: Error) {
+update_area :: proc( db: ^DB, pristine: ARE, old: ARE ) -> (new: ARE, new_pristine: ARE, err: Error) {
     // callee responsible for cleaning up memory of old, new, and pristine
     new = load_ARE( bytes.clone( old.backing ) ) or_return
+    new_pristine = load_ARE( bytes.clone( pristine.backing ) ) or_return
+
+    // Fix IsActive flag
+    new.rest_encounters.is_active = pristine.rest_encounters.is_active
 
     // How many monsters will spawn? sometimes less than this due to encounter difficulty or spawngroup difficulty
     new.rest_encounters.max_creature_spawns = clamp( pristine.rest_encounters.max_creature_spawns * 5, 10, 30 )
@@ -641,7 +645,8 @@ update_area :: proc( db: ^DB, pristine: ARE, old: ARE ) -> (new: ARE, err: Error
         stat.creature_file = resref_copy_to_string( actor.cre_file )
 
         stat.in_actors_list = true
-        stat.display_name = strings.clone( string( bytes.trim_right_null( actor.name[:] ) ) )
+        stat.display_name = strings.clone(string( actor.name[ :bytes.index_byte( actor.name[:], 0 ) ] ))
+
         stat.position_cur = actor.coord_cur
         stat.position_dest = actor.coord_dest
         stat.is_random_spawn = actor.is_random == 1
@@ -659,6 +664,16 @@ update_area :: proc( db: ^DB, pristine: ARE, old: ARE ) -> (new: ARE, err: Error
         add_creature_data( db^, &stat )
         append( &db.actor_stats, stat )
     }
+
+    // replace rest_encounters with spawngrp reference
+    spawngrp : RESREF
+    copy( spawngrp[:2], "RD" )
+    copy( spawngrp[2:], new.header.wed_resource[:6] )
+    copy( new.rest_encounters.creature_refs[0][:], spawngrp[:] )
+    new.rest_encounters.creature_count = 1
+
+    // copy the new rest_encounters to the new_pristine
+    mem.copy( new_pristine.rest_encounters, new.rest_encounters, size_of( ARE_RestEncounter ) )
     return
 }
 locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: LocationData, err: Error) {
