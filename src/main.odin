@@ -8,8 +8,6 @@ import "core:mem"
 import "core:path/filepath"
 import "core:os"
 import "core:slice"
-import "core:strings"
-import rl "vendor:raylib"
 import zlib "vendor:zlib"
 
 DEBUG_MEMORY :: true
@@ -22,6 +20,17 @@ SAVE_NAME := "000000047-all purchases but haste and intercession"
 /* .plan
 FUTURE: fully load .ARE files and rebuild from scratch (to enable changing number of Actors)
 NOTE: struct .header sections are not linked to backing buffer; they are copies. might want to change later
+
+for each area
+    for each actor/rest creature
+        determine if hostile -- load .CRE file and check for hostile flag, also check if in spawngrp?
+        tick frequency of occurance
+    -- Map CreatureName -> CreatureData (frequency, hostile, power level)
+    replace rest encounters with spawngrp entry
+-- Map AreaName -> (Map CreatureName -> CreatureData)
+write all that data out as json
+
+# then, python program generates spawngrp.2DA
 */
 
 ZError :: enum i32 {
@@ -51,6 +60,15 @@ Locator :: bit_field u32 {
     file: u32 | 14, // non-tileset file index (any 12bit value so long as it matches value in BIF)
     tileset: u32 | 6, // tileset index
     bif: u32 | 12, // source BIF index
+}
+Resource :: struct {
+    res : RES,
+    loc : LocationData,
+    backing : []u8,
+}
+RES :: union {
+    CRE,
+    ARE,
 }
 RESType :: enum u16 {
     None = 0,
@@ -84,6 +102,7 @@ Location :: enum {
 }
 LocationData :: struct {
     type : Location,
+    type_pristine : Location,
     path_save_key : string,
     path_override : string,
     path_bif : string,
@@ -91,6 +110,31 @@ LocationData :: struct {
 
     path_save_file_new : string,
     path_override_new : string,
+}
+
+CRE_Header :: struct {
+    signature : [4]u8,
+    version : [4]u8,
+    name_long : STRREF,
+    name_short : STRREF,
+    creature_flags : u32,
+    experience : u32,
+    power_level : u32, // XP for party members, power level for summoning spells
+    gold_carried : u32,
+    permanent_status_flags : u32,
+    hp_current : u16,
+    hp_max : u16,
+    _ignored1 : [0x20c]u8,
+    levels : [3]u8,
+    _ignored2 : [0x39]u8,
+    allegience : u8,
+}
+#assert(offset_of(CRE_Header, hp_max) == 0x26)
+#assert(offset_of(CRE_Header, levels) == 0x234)
+#assert(offset_of(CRE_Header, allegience) == 0x270)
+CRE :: struct {
+    backing : []u8,
+    header : CRE_Header,
 }
 
 ARE_Header :: struct {
@@ -330,6 +374,13 @@ load_BIF :: proc( path: string ) -> (bif: BIF, err: Error) {
     }
     return
 }
+load_CRE :: proc( buf: []u8 ) -> (cre: CRE, err: Error) {
+    cre.backing = buf
+    cre.header = slice.to_type( cre.backing[0:], CRE_Header )
+    assert( cre.header.signature == "CRE ", "Unexpected signature" )
+    assert( cre.header.version == "V1.0", "Unexpected version" )
+    return
+}
 load_ARE :: proc( buf: []u8 ) -> (are: ARE, err: Error) {
     are.backing = buf
     are.header = slice.to_type( are.backing[0:], ARE_Header )
@@ -412,6 +463,15 @@ load_DB :: proc() -> (db: DB, err: Error) {
     }
     return
 }
+
+delete_LocationData :: proc( loc: ^LocationData ) {
+    delete( loc.path_save_key )
+    delete( loc.path_override )
+    delete( loc.path_bif )
+
+    delete( loc.path_save_file_new )
+    delete( loc.path_override_new )
+}
 delete_SAV :: proc( sav: SAV ) {
     for key, value in sav.files {
         delete( sav.files[ key ] )
@@ -424,11 +484,86 @@ delete_DB :: proc( db: ^DB ) {
     delete( db.areas )
     delete( db.key.backing )
 }
-update_area :: proc( db: DB, old: ARE ) -> (new: ARE, err: Error) {
+delete_Resource :: proc( res: ^Resource ) {
+    delete_LocationData( &res.loc )
+    delete( res.backing )
+}
+
+lookup_RES :: proc( db: DB, res_name:string, res_type:RESType, use_pristine:bool = false ) -> (res: Resource, err: Error) {
+    res.loc = locate_resource( db, res_name, res_type ) or_return
+
+    location_type := res.loc.type_pristine if use_pristine else res.loc.type
+    switch location_type {
+    case .Override:
+        res.backing = os.read_entire_file_or_err( res.loc.path_override ) or_return
+    case .Save:
+        db_buf := db.sav.files[ res.loc.path_save_key ] // db owns, so clone it
+        res.backing = bytes.clone( db_buf )
+    case .Data:
+        bif := load_BIF( res.loc.path_bif ) or_return
+        defer delete( bif.backing )
+        bif_file := bif.files[ res.loc.file_index_within_bif ]
+        bif_file_buf := bif.backing[ bif_file.offset:bif_file.offset+bif_file.size ] // bif owns, so clone it
+        res.backing = bytes.clone( bif_file_buf )
+    case .DNE:
+        panic( "Resource DNE" )
+    }
+    
+    #partial switch res_type {
+    case .ARE: res.res = load_ARE( res.backing ) or_return
+    case .CRE: res.res = load_CRE( res.backing ) or_return
+    case: panic( "Not implemented" )
+    }
+    return
+}
+save_RES :: proc( db: ^DB, res_backing: []u8, loc:LocationData, use_pristine:bool = false, write_save:bool = true ) -> (err: Error) {
+    // caller is responsible for cleaning up res backing and location data
+    location_type := loc.type_pristine if use_pristine else loc.type
+    switch location_type {
+    case .Override, .Data:
+        os.write_entire_file_or_err( loc.path_override_new, res_backing ) or_return
+    case .Save:
+        delete( db.sav.files[ loc.path_save_key ] )
+        db.sav.files[ loc.path_save_key ] = bytes.clone( res_backing ) // this persists and is owned by db.sav, so clone it
+        if write_save {
+            save_SAV( db.sav, "dummy.sav" ) or_return
+        }
+    case .DNE: panic( "Resource DNE" )
+    }
+    return
+}
+
+update_areas :: proc( db: ^DB ) -> (err: Error) {
+    for area in db.areas {
+        pristine := lookup_RES( db^, area, .ARE, use_pristine=true ) or_return
+        defer delete_Resource( &pristine )
+        actual := lookup_RES( db^, area, .ARE ) or_return
+        defer delete_Resource( &actual )
+
+        are_new := update_area( db^, pristine.res.(ARE), actual.res.(ARE) ) or_return
+        defer delete( are_new.backing )
+
+        save_RES( db, are_new.backing, actual.loc, write_save=false ) or_return
+    }
+    save_SAV( db.sav, "dummy.sav" ) or_return // batch all the .SAV file changes
+    return
+}
+
+update_area :: proc( db: DB, pristine: ARE, old: ARE ) -> (new: ARE, err: Error) {
     // callee responsible for cleaning up memory of both old and new
     new = load_ARE( bytes.clone( old.backing ) ) or_return
-    new.rest_encounters.max_creature_spawns = 17
-    //fmt.printfln( "Max spawns %d -> %d", old.rest_encounters.max_creature_spawns, new.rest_encounters.max_creature_spawns )
+
+    //TODO: calculate new values based on pristine reference data rather than current values
+    new.rest_encounters.max_creature_spawns = clamp( new.rest_encounters.max_creature_spawns * 5, 10, 30 )
+    // could change spawn probability to 150% but unsure if desired
+    // could adjust encounter difficulty; reduce to create more enemies at lower party level/size
+
+    //TODO collect creature stats and record
+    //fmt.printfln( "Rest Encounter: %s", new.header.wed_resource )
+    for &cre in new.rest_encounters.creature_refs {
+        if cre[0] == 0 { continue }
+        //fmt.printfln( "    %s", resref_move_to_string( &cre ) )
+    }
     return
 }
 locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: LocationData, err: Error) {
@@ -445,12 +580,14 @@ locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: 
             loc.path_bif = filepath.join( {PATH_GAME_BASE, get_Key_Resource_BIF_name( db, res ) } )
             loc.file_index_within_bif = res.loc.file
             loc.type = .Data
+            loc.type_pristine = .Data
             break
         }
     }
     assert( loc.type == .Data, "Resource not found in BIFs, which should be impossible" )
     if os.exists( loc.path_override ) {
         loc.type = .Override
+        loc.type_pristine = .Override
     }
     if loc.path_save_key in db.sav.files {
         loc.type = .Save
@@ -458,59 +595,7 @@ locate_resource :: proc( db: DB, res_name: string, res_type: RESType ) -> (loc: 
     assert( loc.type != .DNE, "Resource not found in any location" )
     return
 }
-delete_LocationData :: proc( loc: ^LocationData ) {
-    delete( loc.path_save_key )
-    delete( loc.path_override )
-    delete( loc.path_bif )
 
-    delete( loc.path_save_file_new )
-    delete( loc.path_override_new )
-}
-update_areas :: proc( db: ^DB ) -> (err: Error){
-    for area in db.areas {
-        loc := locate_resource( db^, area, .ARE ) or_return
-        defer delete_LocationData( &loc )
-
-        switch loc.type {
-        case .Data:
-            bif := load_BIF( loc.path_bif ) or_return
-            defer delete( bif.backing )
-            bif_file := bif.files[ loc.file_index_within_bif ]
-            bif_file_buf := bif.backing[ bif_file.offset:bif_file.offset+bif_file.size ]
-            are_old := load_ARE( bif_file_buf ) or_return
-
-            are_new := update_area( db^, are_old ) or_return
-            defer delete( are_new.backing )
-            
-            os.write_entire_file_or_err( loc.path_override_new, are_new.backing ) or_return
-        case .Override:
-            buf := os.read_entire_file_or_err( loc.path_override ) or_return
-            are_old := load_ARE( buf ) or_return // owned as buf and are_old.backing
-            defer delete( are_old.backing )
-
-            are_new := update_area( db^, are_old ) or_return
-            defer delete( are_new.backing )
-
-            os.write_entire_file_or_err( loc.path_override_new, are_new.backing ) or_return
-        case .Save:
-            buf := db.sav.files[ loc.path_save_key ]
-            are_old := load_ARE( buf ) or_return // memory owned by db.sav, so delete iff replacing
-
-            are_new := update_area( db^, are_old ) or_return
-            delete( are_old.backing ) // cleanup old but db.sav is responsible for deleting new later on
-
-            db.sav.files[ loc.path_save_key ] = are_new.backing
-            // single combined write to save file will occur after loop
-        case .DNE:
-            panic( "Should not have reached here" )
-        }
-    }
-    // save any modifications to the SAV file
-    save_SAV( db.sav, "dummy.sav" ) or_return
-    new_sav := load_SAV( "dummy.sav" ) or_return // sanity check we can load our own save file
-    delete_SAV( new_sav )
-    return
-}
 main :: proc() {
     when DEBUG_MEMORY {
         tracking_allocator : mem.Tracking_Allocator
